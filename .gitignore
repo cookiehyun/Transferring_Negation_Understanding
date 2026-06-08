@@ -1,0 +1,7 @@
+logs/
+outputs/
+*.npy
+*.png
+__pycache__/
+*.pyc
+.env
