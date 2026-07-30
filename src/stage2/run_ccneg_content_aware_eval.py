@@ -46,7 +46,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--lambdas", type=str, default="0.1,0.3,0.5,0.8,1.2,1.6,1.9")
-    parser.add_argument("--extractor", type=str, default="llm", choices=["llm", "rule"])
+    parser.add_argument("--extractor", type=str, default="llm", choices=["llm", "rule", "hybrid"])
     args = parser.parse_args()
 
     cfg = load_stage2_config(args.config)
@@ -56,7 +56,7 @@ def main():
     clip_model.eval().to(device)
     clip_tokenizer = open_clip.get_tokenizer(cfg.clip.backbone)
 
-    if args.extractor == "llm":
+    if args.extractor in ("llm", "hybrid"):
         print(f"Loading LLM: {cfg.model.name_or_path}")
         dtype = getattr(torch, cfg.model.dtype)
         llm_tokenizer = AutoTokenizer.from_pretrained(cfg.model.name_or_path, padding_side="left")
@@ -83,7 +83,8 @@ def main():
 
     print("\nExtracting concepts (once, reused across all lambdas)...")
     e_c, concepts, e_neg, valid_idx, failure_reason = extract_concepts_and_embeddings(
-        clip_model, clip_tokenizer, device, neg_captions, llm_model, llm_tokenizer, extract_fn=extract_fn
+        clip_model, clip_tokenizer, device, neg_captions, llm_model, llm_tokenizer, extract_fn=extract_fn,
+        hybrid=(args.extractor == "hybrid")
     )
     print(f"Successfully extracted: {len(valid_idx)}/{len(neg_captions)} captions")
     from collections import Counter

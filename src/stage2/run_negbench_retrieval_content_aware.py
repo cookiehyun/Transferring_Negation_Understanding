@@ -55,7 +55,10 @@ def main():
     parser.add_argument("--coco_root", type=str, required=True)
     parser.add_argument("--lambdas", type=str, default="0.3,0.5,0.8,1.2,1.9")
     parser.add_argument("--n_images", type=int, default=-1, help="subsample images for a quick test, -1 = all")
-    parser.add_argument("--extractor", type=str, default="llm", choices=["llm", "rule"])
+    parser.add_argument("--extractor", type=str, default="llm", choices=["llm", "rule", "hybrid"],
+                         help="'llm' = our LLM-based extractor, 'rule' = reimplementation of "
+                              "the paper's rule-based parser (Appendix A.1), "
+                              "'hybrid' = LLM first, rule-based fallback on failure")    
     args = parser.parse_args()
 
     cfg = load_stage2_config(args.config)
@@ -65,7 +68,7 @@ def main():
     clip_model.eval().to(device)
     clip_tokenizer = open_clip.get_tokenizer(cfg.clip.backbone)
 
-    if args.extractor == "llm":
+    if args.extractor in ("llm", "hybrid"):
         print(f"Loading LLM: {cfg.model.name_or_path}")
         dtype = getattr(torch, cfg.model.dtype)
         llm_tokenizer = AutoTokenizer.from_pretrained(cfg.model.name_or_path, padding_side="left")
@@ -102,7 +105,8 @@ def main():
 
     print("\nExtracting concepts (once, reused across all lambdas)...")
     e_c, concepts, e_neg, valid_idx, failure_reason = extract_concepts_and_embeddings(
-        clip_model, clip_tokenizer, device, all_texts, llm_model, llm_tokenizer, extract_fn=extract_fn
+        clip_model, clip_tokenizer, device, all_texts, llm_model, llm_tokenizer, extract_fn=extract_fn,
+        hybrid=(args.extractor == "hybrid")
     )
     n_extracted = len(valid_idx)
     print(f"Successfully extracted: {n_extracted}/{len(all_texts)} captions")

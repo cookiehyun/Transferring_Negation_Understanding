@@ -6,30 +6,47 @@ Captions without a negation cue, or where the LLM returned NONE / an
 unverifiable phrase, are left unmodified (matching the source paper's own
 update rule: "if none of the negator words are present, the embedding is
 not updated").
+
+v3 prompt: extracted phrase includes short predicate/copula wording around
+the core noun (e.g. "chair in sight", "cup is visible in the image"), not
+just the bare noun -- this preserves stronger alignment (proj) with the
+original caption embedding, closing most of the gap to the rule-based
+parser's retrieval performance (see project notes: proj 0.664 -> 0.690,
+R@1 0.2568 -> 0.2617 on NegBench Retrieval, full 5000-image set).
 """
 
+import re
 import numpy as np
 import torch
 
-NEGATION_CUES = ["not ", "n't", "no ", "without", "never", "nowhere", "none",
-                 "nothing", "absent", "devoid", "lacks", "lack of"]
+import rule_based_extraction
+
+# rule-based의 검증된 negator 리스트를 그대로 재사용 -- 이걸로 게이트가 놓치는
+# 표현이 있으면 그건 rule-based도 못 잡는 표현이므로 공정한 비교가 보장됨.
+# "absent"는 PRE_NEGATORS에 없고 POST_NEGATOR_PATTERN(is/are/was/were + absent)
+# 에서만 다뤄지는데, 우리 게이트는 그 정규식을 안 쓰므로 따로 추가.
+NEGATION_CUES = [neg.strip() for neg in rule_based_extraction.PRE_NEGATORS] + ["missing", "absent"]
 
 ANCHOR_WORDS = ["neutral", "balanced", "unbiased", "fair"]
 
 SYSTEM_PROMPT = ("You are a precise linguistic tool. Given a sentence containing a negation, "
-                  "output ONLY the exact noun phrase that is being negated -- the thing stated "
-                  "to be absent, not present, or not happening. The phrase must be copied "
-                  "verbatim from the sentence. If there is no single clear concept being negated "
-                  "(e.g. the negation applies to an entire clause, an abstract situation, or a "
-                  "time/quantity expression), output NONE. Output nothing else: no explanation, "
-                  "no punctuation, no quotes.")
+                  "output ONLY the exact phrase describing what is stated to be absent, not "
+                  "present, or not happening -- copy the phrase verbatim from the sentence, "
+                  "including any short descriptive or predicate wording around the core noun "
+                  "(e.g. for 'there is no chair in sight', output 'chair in sight', not just "
+                  "'chair'). If there is no single clear concept being negated (e.g. the "
+                  "negation applies to an entire clause, an abstract situation, or a "
+                  "time/quantity expression), output NONE. Output nothing else: no "
+                  "explanation, no punctuation, no quotes.")
 
 FEW_SHOT_EXAMPLES = [
-    ("person, not waving a flag from the crowd", "flag"),
+    ("A man in a kitchen is making pizzas, but there is no chair in sight.", "chair in sight"),
+    ("No fork is present, but a baker is busy working in the kitchen.", "fork is present"),
+    ("No cup is visible in the image, but the small kitchen is equipped with appliances.", "cup is visible in the image"),
     ("soccer player celebrates without teammates after scoring", "teammates"),
     ("source of the contaminated water ingested by no one", "NONE"),
     ("i 'm not sure what this design is on , but it would n't make an interesting tattoo", "NONE"),
-    ("this drum set is not percent off today", "NONE"),
+    ("No car is in the image, but the front end of a red motorcycle is on display.", "car is in the image"),
     ("private path from your deck to the ocean, not through the dunes", "dunes"),
 ]
 
@@ -48,7 +65,33 @@ def build_messages(caption):
     return messages
 
 
-def extract_negated_concepts(llm_model, llm_tokenizer, captions, batch_size=16, max_new_tokens=12):
+_ARTICLE_RE = re.compile(r"^(a|an|the)\s+")
+
+
+def _normalize(phrase):
+    p = phrase.lower().strip().strip(" .,;:'\"")
+    p = _ARTICLE_RE.sub("", p)
+    return p
+
+
+def _verbatim_match(concept, caption):
+    """Relaxed verbatim check: ignores leading articles (a/an/the) and
+    naive singular/plural variation (trailing 's'), in both directions.
+    Still requires the core noun phrase to actually appear in the caption --
+    this is not a semantic/fuzzy match, just normalization of surface form."""
+    cap = caption.lower()
+    c = _normalize(concept)
+    if not c:
+        return False
+    variants = {c}
+    if c.endswith("s"):
+        variants.add(c[:-1])
+    else:
+        variants.add(c + "s")
+    return any(v in cap for v in variants if v)
+
+
+def extract_negated_concepts(llm_model, llm_tokenizer, captions, batch_size=16, max_new_tokens=20):
     """Returns (concepts, failure_reason), both same length as captions.
     concepts[i]: extracted concept string, or None (no negation cue / NONE / failed validation).
     failure_reason[i]: one of "success", "gate_filtered", "explicit_none", "verbatim_mismatch".
@@ -82,13 +125,45 @@ def extract_negated_concepts(llm_model, llm_tokenizer, captions, batch_size=16, 
             if concept.upper() == "NONE" or not concept:
                 concepts[i] = None
                 failure_reason[i] = "explicit_none"
-            elif concept.lower() not in caption.lower():
+            elif not _verbatim_match(concept, caption):
                 concepts[i] = None  # invalid / hallucinated, treat as extraction failure
                 failure_reason[i] = "verbatim_mismatch"
             else:
                 concepts[i] = concept
                 failure_reason[i] = "success"
     return concepts, failure_reason
+
+
+def extract_negated_concepts_hybrid(llm_model, llm_tokenizer, captions, batch_size=16, max_new_tokens=20):
+    """LLM 추출을 우선 시도하고, 실패한(explicit_none/verbatim_mismatch/gate_filtered)
+    캡션만 rule-based로 대체. rule도 실패하면 그때만 진짜 실패(None)로 남김.
+    failure_reason에 "llm_success"/"rule_fallback"/"both_failed_<원래사유>"를 남겨서
+    최종 결과 중 몇 %가 어느 경로에서 왔는지 분해해서 볼 수 있게 함.
+
+    Note (project finding): on NegBench Retrieval this was *not* better than
+    LLM-only (v3 prompt) -- the extra coverage from rule_fallback captions
+    (very ambiguous ones the LLM correctly gave up on) can pull scores down.
+    Kept as an option for tasks where it *did* help (NegBench MCQ)."""
+    concepts, failure_reason = extract_negated_concepts(
+        llm_model, llm_tokenizer, captions, batch_size=batch_size, max_new_tokens=max_new_tokens
+    )
+    rule_concepts = rule_based_extraction.extract_negated_concepts(captions)
+
+    final_concepts = list(concepts)
+    final_reason = []
+    for c, r, rc in zip(concepts, failure_reason, rule_concepts):
+        if c is not None:
+            final_reason.append("llm_success")
+        elif rc is not None:
+            final_reason.append("rule_fallback")
+        else:
+            final_reason.append(f"both_failed_{r}")
+
+    for i, rc in enumerate(rule_concepts):
+        if concepts[i] is None and rc is not None:
+            final_concepts[i] = rc
+
+    return final_concepts, final_reason
 
 
 def get_clip_text_embeddings(model, tokenizer, texts, device, batch_size=128):
@@ -109,19 +184,20 @@ def compute_anchor(clip_model, clip_tokenizer, device):
 
 
 def extract_concepts_and_embeddings(clip_model, clip_tokenizer, device, texts,
-                                     llm_model, llm_tokenizer, extract_fn=None):
+                                     llm_model, llm_tokenizer, extract_fn=None, hybrid=False):
     """Runs extraction and CLIP encoding once. Returns e_c (N,dim),
     concepts (list of str/None), e_neg (N,dim) with zeros for invalid rows,
-    valid_idx, and failure_reason (list of str, same length as texts;
-    "success" for valid_idx entries, "rule_based_no_match" if extract_fn was
-    used since the rule-based parser has no comparable failure taxonomy).
+    valid_idx, and failure_reason (list of str, same length as texts).
 
     extract_fn: optional callable(captions, llm_model=None, llm_tokenizer=None)
     -> list of concept/None. Defaults to the LLM-based extractor. Pass
-    rule_based_extraction.extract_negated_concepts for the rule-based parser."""
+    rule_based_extraction.extract_negated_concepts for the rule-based parser.
+    hybrid: if True, uses extract_negated_concepts_hybrid instead (overrides extract_fn)."""
     e_c = get_clip_text_embeddings(clip_model, clip_tokenizer, texts, device)
 
-    if extract_fn is None:
+    if hybrid:
+        concepts, failure_reason = extract_negated_concepts_hybrid(llm_model, llm_tokenizer, texts)
+    elif extract_fn is None:
         concepts, failure_reason = extract_negated_concepts(llm_model, llm_tokenizer, texts)
     else:
         concepts = extract_fn(texts, llm_model=llm_model, llm_tokenizer=llm_tokenizer)
