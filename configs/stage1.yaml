@@ -1,0 +1,29 @@
+# Stage 1: negation direction extraction (RepE)
+# sample size matches Al Mofael et al. 2026 (arXiv:2603.12423), 12k negation pairs
+# split ratio is standard 80/20, not RepE-specific
+
+seed: 42
+run_name: stage1_llama3.1-8b_ccneg12k
+
+model:
+  name_or_path: /fs/dss/home/gaad2403/models/llama3.1-8b
+  dtype: float16
+  device_map: auto
+
+data:
+  source: ccneg
+  pairs_path: outputs/ccneg/ccneg_pairs.json
+  n_samples: 12000
+  train_test_split: 0.8
+  split_seed: 42
+
+repe:
+  rep_token: -1
+  direction_method: pca
+  n_difference: 1
+  batch_size: 16
+
+output:
+  vectors_dir: outputs/vectors
+  figures_dir: outputs/figures
+  accuracy_threshold: 0.7

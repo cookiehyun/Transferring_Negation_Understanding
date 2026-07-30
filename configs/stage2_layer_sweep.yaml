@@ -1,0 +1,32 @@
+# Stage 1 picked -16 as best for within-LLM negation classification, but
+# that criterion (classification accuracy) doesn't guarantee it's the best
+# layer for cross-model transfer. This sweeps the peak region found in
+# Stage 1 (-11 to -19) and re-fits orthogonal Procrustes at each layer,
+# selecting whichever layer gives the highest transfer_sim.
+
+seed: 42
+run_name: stage2_layer_sweep_llama3.1-8b_clipvitb32_ccneg
+
+model:
+  name_or_path: /fs/dss/home/gaad2403/models/llama3.1-8b
+  dtype: float16
+  device_map: auto
+
+clip:
+  backbone: ViT-B-32-quickgelu
+  pretrained: openai
+
+data:
+  source: ccneg
+  pairs_path: outputs/ccneg/ccneg_pairs.json
+  n_samples: 12000
+  train_test_split: 0.8
+  split_seed: 42
+
+layer_sweep:
+  directions_path: outputs/vectors/stage1_llama3.1-8b_ccneg12k_20260727_034005/negation_directions_all_layers.npy
+  candidate_layers: [-11, -12, -13, -14, -15, -16, -17, -18, -19]
+
+output:
+  vectors_dir: outputs/vectors
+  figures_dir: outputs/figures

@@ -1,0 +1,28 @@
+# alpha sweep for embedding correction, formula and re-normalization step
+# match fawazsammani/negation-steering (arXiv:2603.20554), Eq. 1:
+#   e' = (1-alpha)*e + alpha*direction*||e||, then re-normalize e'
+# alpha=0.13 was their best value on SimpleNeg; we sweep around it here
+# since our direction vector and data differ.
+
+seed: 42
+run_name: stage2_correction_llama3.1-8b_clipvitb32_ccneg
+
+clip:
+  backbone: ViT-B-32-quickgelu
+  pretrained: openai
+
+image_eval:
+  manifest_path: outputs/ccneg/ccneg_image_manifest.json
+  n_samples: 5000
+  seed: 42
+
+vectors:
+  stage2_run_dir: outputs/vectors/stage2_llama3.1-8b_clipvitb32_ccneg_20260727_023858
+  transferred_dir_file: clip_neg_dir_transferred.npy
+  native_dir_file: clip_neg_dir_native.npy
+
+alphas: [0.0, 0.05, 0.1, 0.13, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+output:
+  figures_dir: outputs/figures
+  vectors_dir: outputs/vectors
