@@ -13,6 +13,14 @@ just the bare noun -- this preserves stronger alignment (proj) with the
 original caption embedding, closing most of the gap to the rule-based
 parser's retrieval performance (see project notes: proj 0.664 -> 0.690,
 R@1 0.2568 -> 0.2617 on NegBench Retrieval, full 5000-image set).
+
+NOTE: FEW_SHOT_EXAMPLES was audited post-hoc against NegBench val/test
+splits. One example ("chair in sight", drawn from an earlier debugging
+session) was found to literally overlap with a single NegBench Retrieval
+test caption (1/25,014). It has been replaced with a synthetic sentence
+never drawn from any evaluation split (previously validated as part of the
+v3-generic ablation, which showed near-identical performance to the
+original v3 prompt: R@1 0.2824 vs 0.2841 on the test split).
 """
 
 import re
@@ -25,6 +33,8 @@ import rule_based_extraction
 # 표현이 있으면 그건 rule-based도 못 잡는 표현이므로 공정한 비교가 보장됨.
 # "absent"는 PRE_NEGATORS에 없고 POST_NEGATOR_PATTERN(is/are/was/were + absent)
 # 에서만 다뤄지는데, 우리 게이트는 그 정규식을 안 쓰므로 따로 추가.
+# "isn't"도 PRE_NEGATORS에 명시적으로 없어 따로 추가 (fixed after a
+# generalization probe found "isn't a single car..." was gate_filtered).
 NEGATION_CUES = [neg.strip() for neg in rule_based_extraction.PRE_NEGATORS] + ["missing", "absent", "isn't"]
 
 ANCHOR_WORDS = ["neutral", "balanced", "unbiased", "fair"]
@@ -33,20 +43,37 @@ SYSTEM_PROMPT = ("You are a precise linguistic tool. Given a sentence containing
                   "output ONLY the exact phrase describing what is stated to be absent, not "
                   "present, or not happening -- copy the phrase verbatim from the sentence, "
                   "including any short descriptive or predicate wording around the core noun "
-                  "(e.g. for 'there is no chair in sight', output 'chair in sight', not just "
+                  "(e.g. for 'there is no bench in sight', output 'bench in sight', not just "
                   "'chair'). If there is no single clear concept being negated (e.g. the "
                   "negation applies to an entire clause, an abstract situation, or a "
                   "time/quantity expression), output NONE. Output nothing else: no "
                   "explanation, no punctuation, no quotes.")
 
 FEW_SHOT_EXAMPLES = [
-    ("A man in a kitchen is making pizzas, but there is no chair in sight.", "chair in sight"),
+    ("The garden was lovely, but there was no bench in sight.", "bench in sight"),
     ("No fork is present, but a baker is busy working in the kitchen.", "fork is present"),
     ("No cup is visible in the image, but the small kitchen is equipped with appliances.", "cup is visible in the image"),
     ("soccer player celebrates without teammates after scoring", "teammates"),
     ("source of the contaminated water ingested by no one", "NONE"),
     ("i 'm not sure what this design is on , but it would n't make an interesting tattoo", "NONE"),
     ("No car is in the image, but the front end of a red motorcycle is on display.", "car is in the image"),
+    ("private path from your deck to the ocean, not through the dunes", "dunes"),
+]
+
+# --- v3-generic ablation: kept as a separate, fully independent set of
+# synthetic examples for the ablation experiment (probes whether v3's gain
+# is due to the *instruction* vs specific example sentences). Distinct from
+# FEW_SHOT_EXAMPLES above so the ablation remains meaningful even though
+# FEW_SHOT_EXAMPLES itself is now also fully synthetic. ---
+GENERIC_FEW_SHOT_EXAMPLES = [
+    ("The garden was lovely, but there was no bench in sight.", "bench in sight"),
+    ("No umbrella is present, though the picnic table looks inviting.", "umbrella is present"),
+    ("No lamp is visible in the photo, but the desk is neatly organized.", "lamp is visible in the photo"),
+    ("person, not waving a flag from the crowd", "flag"),
+    ("soccer player celebrates without teammates after scoring", "teammates"),
+    ("source of the contaminated water ingested by no one", "NONE"),
+    ("i 'm not sure what this design is on , but it would n't make an interesting tattoo", "NONE"),
+    ("No kite is in the picture, where a child is playing near the swings.", "kite is in the picture"),
     ("private path from your deck to the ocean, not through the dunes", "dunes"),
 ]
 
@@ -59,6 +86,15 @@ def has_negation(text):
 def build_messages(caption):
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for ex_sentence, ex_answer in FEW_SHOT_EXAMPLES:
+        messages.append({"role": "user", "content": f"Sentence: {ex_sentence}"})
+        messages.append({"role": "assistant", "content": ex_answer})
+    messages.append({"role": "user", "content": f"Sentence: {caption}"})
+    return messages
+
+
+def build_messages_generic(caption):
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for ex_sentence, ex_answer in GENERIC_FEW_SHOT_EXAMPLES:
         messages.append({"role": "user", "content": f"Sentence: {ex_sentence}"})
         messages.append({"role": "assistant", "content": ex_answer})
     messages.append({"role": "user", "content": f"Sentence: {caption}"})
@@ -134,16 +170,52 @@ def extract_negated_concepts(llm_model, llm_tokenizer, captions, batch_size=16, 
     return concepts, failure_reason
 
 
+def extract_negated_concepts_generic(llm_model, llm_tokenizer, captions, batch_size=16, max_new_tokens=20):
+    """Same as extract_negated_concepts but uses GENERIC_FEW_SHOT_EXAMPLES
+    (ablation: verifies v3's gain is not due to specific example sentences)."""
+    concepts = [None] * len(captions)
+    failure_reason = ["gate_filtered"] * len(captions)
+    idx_to_process = [i for i, c in enumerate(captions) if has_negation(c)]
+    if not idx_to_process:
+        return concepts, failure_reason
+
+    device = llm_model.device
+    for start in range(0, len(idx_to_process), batch_size):
+        batch_idx = idx_to_process[start:start + batch_size]
+        batch = [captions[i] for i in batch_idx]
+        chat_prompts = [
+            llm_tokenizer.apply_chat_template(
+                build_messages_generic(c), tokenize=False, add_generation_prompt=True
+            ) for c in batch
+        ]
+        enc = llm_tokenizer(chat_prompts, return_tensors="pt", padding=True, truncation=True,
+                             max_length=768).to(device)
+        with torch.no_grad():
+            out = llm_model.generate(
+                **enc, max_new_tokens=max_new_tokens, do_sample=False,
+                pad_token_id=llm_tokenizer.eos_token_id,
+            )
+        gen_only = out[:, enc["input_ids"].shape[1]:]
+        decoded = llm_tokenizer.batch_decode(gen_only, skip_special_tokens=True)
+        for i, d, caption in zip(batch_idx, decoded, batch):
+            concept = d.strip().split("\n")[0].strip().strip('."\'')
+            if concept.upper() == "NONE" or not concept:
+                concepts[i] = None
+                failure_reason[i] = "explicit_none"
+            elif not _verbatim_match(concept, caption):
+                concepts[i] = None
+                failure_reason[i] = "verbatim_mismatch"
+            else:
+                concepts[i] = concept
+                failure_reason[i] = "success"
+    return concepts, failure_reason
+
+
 def extract_negated_concepts_hybrid(llm_model, llm_tokenizer, captions, batch_size=16, max_new_tokens=20):
     """LLM 추출을 우선 시도하고, 실패한(explicit_none/verbatim_mismatch/gate_filtered)
     캡션만 rule-based로 대체. rule도 실패하면 그때만 진짜 실패(None)로 남김.
     failure_reason에 "llm_success"/"rule_fallback"/"both_failed_<원래사유>"를 남겨서
-    최종 결과 중 몇 %가 어느 경로에서 왔는지 분해해서 볼 수 있게 함.
-
-    Note (project finding): on NegBench Retrieval this was *not* better than
-    LLM-only (v3 prompt) -- the extra coverage from rule_fallback captions
-    (very ambiguous ones the LLM correctly gave up on) can pull scores down.
-    Kept as an option for tasks where it *did* help (NegBench MCQ)."""
+    최종 결과 중 몇 %가 어느 경로에서 왔는지 분해해서 볼 수 있게 함."""
     concepts, failure_reason = extract_negated_concepts(
         llm_model, llm_tokenizer, captions, batch_size=batch_size, max_new_tokens=max_new_tokens
     )
@@ -183,8 +255,43 @@ def compute_anchor(clip_model, clip_tokenizer, device):
     return a.mean(axis=0)
 
 
+def load_clip_backend(backend, backbone, pretrained, device, conclip_ckpt=None):
+    """backend: 'openai' (default CLIP weights), 'negclip' (hard-negative
+    fine-tuned, same ViT-B-32-quickgelu architecture -- weights swap in
+    directly, rest of the pipeline unchanged), or 'conclip' (fine-tuned on
+    CC-Neg itself; uses the OpenAI clip package/tokenizer instead of
+    open_clip, so its tokenizer callable has a different signature but is
+    still callable as tokenizer(batch) via clip.tokenize)."""
+    import open_clip
+    if backend == "conclip":
+        import clip as openai_clip
+        from huggingface_hub import hf_hub_download
+        ckpt_path = conclip_ckpt or hf_hub_download(repo_id="jaisidhsingh/conclip", filename="conclip_vit_b32.pt")
+        model, preprocess = openai_clip.load("ViT-B/32", device=device)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model = model.float()
+        model.load_state_dict(ckpt["model"])
+        model.eval().to(device)
+        return model, preprocess, openai_clip.tokenize
+    if backend == "negclip":
+        from huggingface_hub import hf_hub_download
+        ckpt_path = hf_hub_download(repo_id="Nano1337/openclip-negclip", filename="pytorch_model.bin")
+        model, _, preprocess = open_clip.create_model_and_transforms(backbone, pretrained=None)
+        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        if isinstance(state_dict, dict) and "state_dict" in state_dict:
+            state_dict = state_dict["state_dict"]
+        state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict, strict=False)
+    else:
+        model, _, preprocess = open_clip.create_model_and_transforms(backbone, pretrained=pretrained)
+    model.eval().to(device)
+    tokenizer = open_clip.get_tokenizer(backbone)
+    return model, preprocess, tokenizer
+
+
 def extract_concepts_and_embeddings(clip_model, clip_tokenizer, device, texts,
-                                     llm_model, llm_tokenizer, extract_fn=None, hybrid=False):
+                                     llm_model, llm_tokenizer, extract_fn=None,
+                                     hybrid=False, generic=False):
     """Runs extraction and CLIP encoding once. Returns e_c (N,dim),
     concepts (list of str/None), e_neg (N,dim) with zeros for invalid rows,
     valid_idx, and failure_reason (list of str, same length as texts).
@@ -192,10 +299,14 @@ def extract_concepts_and_embeddings(clip_model, clip_tokenizer, device, texts,
     extract_fn: optional callable(captions, llm_model=None, llm_tokenizer=None)
     -> list of concept/None. Defaults to the LLM-based extractor. Pass
     rule_based_extraction.extract_negated_concepts for the rule-based parser.
-    hybrid: if True, uses extract_negated_concepts_hybrid instead (overrides extract_fn)."""
+    hybrid: if True, uses extract_negated_concepts_hybrid instead (overrides extract_fn).
+    generic: if True, uses extract_negated_concepts_generic (v3-generic ablation,
+    overrides extract_fn and hybrid)."""
     e_c = get_clip_text_embeddings(clip_model, clip_tokenizer, texts, device)
 
-    if hybrid:
+    if generic:
+        concepts, failure_reason = extract_negated_concepts_generic(llm_model, llm_tokenizer, texts)
+    elif hybrid:
         concepts, failure_reason = extract_negated_concepts_hybrid(llm_model, llm_tokenizer, texts)
     elif extract_fn is None:
         concepts, failure_reason = extract_negated_concepts(llm_model, llm_tokenizer, texts)

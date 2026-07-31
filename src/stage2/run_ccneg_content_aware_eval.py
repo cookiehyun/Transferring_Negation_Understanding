@@ -21,7 +21,7 @@ import open_clip
 sys.path.insert(0, os.path.dirname(__file__))
 from content_aware_correction import (
     get_clip_text_embeddings, compute_anchor, extract_concepts_and_embeddings,
-    apply_correction_given_embeddings
+    apply_correction_given_embeddings, load_clip_backend
 )
 import rule_based_extraction
 
@@ -47,14 +47,15 @@ def main():
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--lambdas", type=str, default="0.1,0.3,0.5,0.8,1.2,1.6,1.9")
     parser.add_argument("--extractor", type=str, default="llm", choices=["llm", "rule", "hybrid"])
+    parser.add_argument("--clip_backend", type=str, default="openai", choices=["openai", "negclip", "conclip"])
     args = parser.parse_args()
 
     cfg = load_stage2_config(args.config)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(cfg.clip.backbone, pretrained=cfg.clip.pretrained)
-    clip_model.eval().to(device)
-    clip_tokenizer = open_clip.get_tokenizer(cfg.clip.backbone)
+    clip_model, clip_preprocess, clip_tokenizer = load_clip_backend(
+        args.clip_backend, cfg.clip.backbone, cfg.clip.pretrained, device
+    )
 
     if args.extractor in ("llm", "hybrid"):
         print(f"Loading LLM: {cfg.model.name_or_path}")

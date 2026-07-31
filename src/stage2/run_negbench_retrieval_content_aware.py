@@ -16,7 +16,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import open_clip
 
 sys.path.insert(0, os.path.dirname(__file__))
-from content_aware_correction import compute_anchor, extract_concepts_and_embeddings, apply_correction_given_embeddings
+from content_aware_correction import compute_anchor, extract_concepts_and_embeddings, apply_correction_given_embeddings, load_clip_backend
 import rule_based_extraction
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -55,20 +55,22 @@ def main():
     parser.add_argument("--coco_root", type=str, required=True)
     parser.add_argument("--lambdas", type=str, default="0.3,0.5,0.8,1.2,1.9")
     parser.add_argument("--n_images", type=int, default=-1, help="subsample images for a quick test, -1 = all")
-    parser.add_argument("--extractor", type=str, default="llm", choices=["llm", "rule", "hybrid"],
+    parser.add_argument("--extractor", type=str, default="llm", choices=["llm", "rule", "hybrid", "generic"],
                          help="'llm' = our LLM-based extractor, 'rule' = reimplementation of "
                               "the paper's rule-based parser (Appendix A.1), "
-                              "'hybrid' = LLM first, rule-based fallback on failure")    
+                              "'hybrid' = LLM first, rule-based fallback on failure, "
+                              "'generic' = v3 pattern with non-NegBench few-shot examples (ablation)")
+    parser.add_argument("--clip_backend", type=str, default="openai", choices=["openai", "negclip", "conclip"])    
     args = parser.parse_args()
 
     cfg = load_stage2_config(args.config)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(cfg.clip.backbone, pretrained=cfg.clip.pretrained)
-    clip_model.eval().to(device)
-    clip_tokenizer = open_clip.get_tokenizer(cfg.clip.backbone)
+    clip_model, clip_preprocess, clip_tokenizer = load_clip_backend(
+        args.clip_backend, cfg.clip.backbone, cfg.clip.pretrained, device
+    )
 
-    if args.extractor in ("llm", "hybrid"):
+    if args.extractor in ("llm", "hybrid", "generic"):
         print(f"Loading LLM: {cfg.model.name_or_path}")
         dtype = getattr(torch, cfg.model.dtype)
         llm_tokenizer = AutoTokenizer.from_pretrained(cfg.model.name_or_path, padding_side="left")
@@ -106,7 +108,7 @@ def main():
     print("\nExtracting concepts (once, reused across all lambdas)...")
     e_c, concepts, e_neg, valid_idx, failure_reason = extract_concepts_and_embeddings(
         clip_model, clip_tokenizer, device, all_texts, llm_model, llm_tokenizer, extract_fn=extract_fn,
-        hybrid=(args.extractor == "hybrid")
+        hybrid=(args.extractor == "hybrid"), generic=(args.extractor == "generic")
     )
     n_extracted = len(valid_idx)
     print(f"Successfully extracted: {n_extracted}/{len(all_texts)} captions")
