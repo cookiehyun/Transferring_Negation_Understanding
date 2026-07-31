@@ -1,0 +1,44 @@
+# Stage 2: CLIP collapse check (image-anchored, CC-Neg style) + LLM -> CLIP
+# direction transfer.
+#
+# Part A follows CC-Neg's own "original-over-negation accuracy": for each
+# image, correct if cosine(image, positive caption) > cosine(image, negative
+# caption). Chance level is 50%.
+#
+# Part B fits W as a semi-orthogonal (Procrustes) map rather than plain
+# least squares, to preserve direction/norm structure during the LLM(4096)
+# -> CLIP(512) projection.
+
+seed: 42
+run_name: stage2_llama3.1-8b_clipvitb32_ccneg
+
+model:
+  name_or_path: Qwen/Qwen2.5-14B-Instruct
+  dtype: float16
+  device_map: auto
+
+clip:
+  backbone: ViT-B-32-quickgelu
+  pretrained: openai
+
+data:
+  source: ccneg
+  pairs_path: outputs/ccneg/ccneg_pairs.json
+  n_samples: 60000   # was 12000 (reused from Stage 1 without separate justification);
+                      # Part B is a different estimation problem (cross-model regression),
+                      # scaling this up directly targets the param/sample ratio issue
+  train_test_split: 0.8
+  split_seed: 42
+
+image_eval:
+  manifest_path: outputs/ccneg/ccneg_image_manifest.json
+  n_samples: 5000
+  seed: 42
+
+stage1_vectors:
+  directions_path: outputs/vectors/stage1_llama3.1-8b_ccneg12k_20260727_034005/negation_directions_all_layers.npy
+  layer: -15
+
+output:
+  vectors_dir: outputs/vectors
+  figures_dir: outputs/figures

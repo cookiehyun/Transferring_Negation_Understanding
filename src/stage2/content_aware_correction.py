@@ -25,7 +25,7 @@ import rule_based_extraction
 # 표현이 있으면 그건 rule-based도 못 잡는 표현이므로 공정한 비교가 보장됨.
 # "absent"는 PRE_NEGATORS에 없고 POST_NEGATOR_PATTERN(is/are/was/were + absent)
 # 에서만 다뤄지는데, 우리 게이트는 그 정규식을 안 쓰므로 따로 추가.
-NEGATION_CUES = [neg.strip() for neg in rule_based_extraction.PRE_NEGATORS] + ["missing", "absent"]
+NEGATION_CUES = [neg.strip() for neg in rule_based_extraction.PRE_NEGATORS] + ["missing", "absent", "isn't"]
 
 ANCHOR_WORDS = ["neutral", "balanced", "unbiased", "fair"]
 
